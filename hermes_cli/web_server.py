@@ -383,6 +383,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Security headers. This dashboard manages config and API keys but shipped with
+# NO X-Frame-Options, NO Content-Security-Policy and NO nosniff, so any page the
+# operator's browser loaded could frame it invisibly and clickjack it. Binding to
+# a private address does NOT help: the attack arrives through the operator's own
+# browser, which can already route to that address.
+#
+# frame-ancestors, not DENY: the WebUI's external-app-tab extension deliberately
+# frames this dashboard, so the policy names that one origin and refuses the rest.
+# X-Frame-Options is intentionally NOT sent — it has no allowlist beyond SAMEORIGIN
+# and would block the intended embed on browsers that honour it over CSP.
+# Every origin the WebUI can be reached on — the operator may open it by Tailscale
+# address, by localhost, or by loopback IP, and frame-ancestors matches the PARENT's
+# origin exactly, so all three must be listed or the embed is refused.
+_DASHBOARD_FRAME_ANCESTORS = os.environ.get(
+    # Operator does not use localhost for the WebUI (stated 2026-09-11), so this is
+    # the single Tailscale origin — the narrowest policy that still allows the
+    # external-app-tab embed. Override with the env var if that ever changes.
+    "HERMES_DASHBOARD_FRAME_ANCESTORS",
+    "http://100.97.180.34:8787",
+).strip()
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy", f"frame-ancestors {_DASHBOARD_FRAME_ANCESTORS}")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
 # Endpoints that do NOT require the session token; everything else under /api/
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
 # drift (/api/status once 401'd under the OAuth gate, breaking the portal probe).

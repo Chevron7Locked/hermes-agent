@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -50,6 +51,16 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
+
+
+def _workspace_retain_context(workspace: str) -> str:
+    """Sharper default retain context naming the workspace (B4): extraction quality
+    signal, since tool-rich engineering sessions differ from chat."""
+    slug = (workspace or "").strip()
+    if not slug or slug == "hermes":
+        return _RETAIN_CONTEXT_DEFAULT
+    return (f"engineering session between Hermes Agent and Kevin in workspace {slug} "
+            + "tool-rich terminal work; extract durable facts, not narration")
 
 
 def _ensure_client_dependency() -> None:
@@ -289,6 +300,41 @@ def _event_timestamp() -> str:
     return event_time.isoformat(timespec="seconds")
 
 
+# Secret-shaped strings must never enter a memory bank (transcripts contain tool
+# output). Applied retain-side at the single choke point (_build_retain_kwargs).
+_REDACTED = "[REDACTED]"
+_SECRET_PATTERNS = tuple(re.compile(p) for p in (
+    r"sk-[A-Za-z0-9]{20,}",                                   # openai-style keys
+    r"Bearer\s+[A-Za-z0-9._-]{20,}",                          # auth headers
+    r"eyJ[A-Za-z0-9_-]{20,}",                                 # JWTs (base64 {" header)
+    r"xoxb-[A-Za-z0-9-]{10,}",                                # slack tokens
+    r"gh[pousr]_[A-Za-z0-9]{20,}",                            # github tokens
+    r"AKIA[0-9A-Z]{16}",                                      # aws access keys
+    r"(?i)(api[_-]?key|token|password|secret)[\"'=:\s]+\S{12,}",  # labelled values
+))
+# Keep the matched label ("api_key", "token", ...) in the redacted output.
+_LABELLED_SECRET = _SECRET_PATTERNS[-1]
+
+
+def _scrub_secrets(value):
+    """Recursively redact secret-shaped strings from *value* (str/dict/list);
+    None -> "", numbers and other scalars pass through as strings."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        for pattern in _SECRET_PATTERNS:
+            if pattern is _LABELLED_SECRET:
+                value = pattern.sub(lambda m: f"{m.group(1)}: {_REDACTED}", value)
+            else:
+                value = pattern.sub(_REDACTED, value)
+        return value
+    if isinstance(value, dict):
+        return {k: _scrub_secrets(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_secrets(v) for v in value]
+    return str(value)
+
+
 def _mint_document_id(session_id: str) -> str:
     """Per-process document id: reusing session_id alone overwrote the document on
     /resume (the reloaded session's first retain replaced the stored content)."""
@@ -320,6 +366,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # Each server-side op status poll is a round trip — coarser than the 0.05s queue poll.
     _RETAIN_OP_POLL_INTERVAL_S = 0.5
+    # Class default: _apply_retain_policy runs in __init__ before initialize() sets
+    # the real _agent_workspace from _SESSION_KWARGS.
+    _agent_workspace = ""
 
     def backup_paths(self) -> List[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
@@ -333,6 +382,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout, self._idle_timeout = _DEFAULT_TIMEOUT, _DEFAULT_IDLE_TIMEOUT
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
         self._bank_mission, self._bank_retain_mission = "", None
+        self._bank_observations_mission = self._bank_reflect_mission = None
+        self._bank_dispositions: Optional[Dict[str, Any]] = None
+        self._bank_entity_labels: Optional[List[Dict[str, Any]]] = None
+        self._bank_config_pushed = False
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
         self._prefetch_method = "recall"  # "recall" or "reflect"
         for name in _SESSION_KWARGS:
@@ -430,6 +483,10 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
+            {"key": "bank_observations_mission", "description": "Mission for the bank's observation/consolidation layer (pushed to the server on first retain)"},
+            {"key": "bank_reflect_mission", "description": "Mission for the bank's reflect/synthesis persona (pushed to the server on first retain)"},
+            {"key": "bank_dispositions", "description": "Bank dispositions as {skepticism, literalism, empathy} ints 0-5 (pushed to the server on first retain)"},
+            {"key": "bank_entity_labels", "description": "Entity label groups (LabelGroup dicts with 'values': [{'value': v}]) pushed to the server on first retain"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
@@ -730,10 +787,20 @@ class HindsightMemoryProvider(MemoryProvider):
         self._llm_base_url = cfg.get("llm_base_url", "")
 
         banks = cfg_get(cfg, "banks", "hermes", default={})
+        # HINDSIGHT_BANK_ID must win over config.json. The tokbuster-kanban
+        # plugin sets it per worker (board -> repo bank) BEFORE initialize()
+        # runs; config.json's static bank_id (or the banks.* bankId default)
+        # is only the fallback for processes that never set it. Without this
+        # precedence the plugin's per-repo wiring is dead: with config.json
+        # present, every worker resolves the shared config bank no matter
+        # what the environment says (R28 memory-consolidation finding).
+        static_bank_id = (os.environ.get("HINDSIGHT_BANK_ID")
+                          or cfg.get("bank_id")
+                          or banks.get("bankId", "hermes"))
         self._bank_id_template = cfg.get("bank_id_template", "") or ""
         self._bank_id = _resolve_bank_id_template(
             self._bank_id_template,
-            fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
+            fallback=static_bank_id,
             profile=self._agent_identity, workspace=self._agent_workspace,
             platform=self._platform, user=self._user_id, session=self._session_id,
         )
@@ -745,6 +812,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_method = prefetch_method if prefetch_method in {"recall", "reflect"} else "recall"
         self._bank_mission = cfg.get("bank_mission", "")
         self._bank_retain_mission = cfg.get("bank_retain_mission") or None
+        self._bank_observations_mission = cfg.get("bank_observations_mission") or None
+        self._bank_reflect_mission = cfg.get("bank_reflect_mission") or None
+        self._bank_dispositions = cfg.get("bank_dispositions") or None
+        self._bank_entity_labels = cfg.get("bank_entity_labels") or None
 
     def _apply_retain_settings(self, cfg: dict) -> None:
         def _cfg_or_env(key: str, env_var: str, default: str = "") -> Any:
@@ -768,7 +839,7 @@ class HindsightMemoryProvider(MemoryProvider):
         """Pure-config retain knobs (no env/secret reads; ``{}`` yields the defaults)."""
         self._auto_retain = cfg.get("auto_retain", True)
         self._retain_every_n_turns = max(1, int(cfg.get("retain_every_n_turns", 1)))
-        self._retain_context = cfg.get("retain_context", _RETAIN_CONTEXT_DEFAULT)
+        self._retain_context = cfg.get("retain_context") or _workspace_retain_context(self._agent_workspace)
         self._retain_async = cfg.get("retain_async", True)
         # On by default so the user SEES memory working whether or not the model
         # mentions it; off switch for customer-facing agents (recall_indicator too).
@@ -778,10 +849,14 @@ class HindsightMemoryProvider(MemoryProvider):
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 10.0))
+        # Pre-compress checkpoint budget: must sit strictly BELOW the compression
+        # stall watchdog (120s) so a slow memory lane fails into skip-compaction
+        # instead of racing the watchdog and stalling the turn.
+        self._checkpoint_timeout = float(cfg.get("checkpoint_timeout", 60.0))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
-        self._recall_tags = cfg.get("recall_tags") or None
+        self._recall_tags = _normalize_retain_tags(cfg.get("recall_tags")) or None
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
@@ -878,7 +953,9 @@ class HindsightMemoryProvider(MemoryProvider):
     def _recall(self, query: str) -> list:
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
-            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+            # Normalize to a list: the client's RecallRequest pydantic model
+            # rejects a bare comma-string ('Input should be a valid list').
+            kwargs.update(tags=_normalize_retain_tags(self._recall_tags), tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
@@ -990,11 +1067,12 @@ class HindsightMemoryProvider(MemoryProvider):
                              occurred_at: str | None = None, update_mode: str | None = None) -> Dict[str, Any]:
         """Build one aretain_batch item. The server resolves occurred_start/end (incl.
         relative phrases in content) from the item timestamp: explicit occurred_at
-        wins, else the configured event clock."""
+        wins, else the configured event clock. Content and metadata values are
+        scrubbed for secret-shaped strings (B1 redaction — single choke point)."""
         item: Dict[str, Any] = {
             # See #93568.
-            "content": content,
-            "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
+            "content": _scrub_secrets(content),
+            "metadata": _scrub_secrets(metadata or self._build_metadata(message_count=1, turn_index=self._turn_index)),
             "timestamp": (occurred_at or "").strip() or _event_timestamp(),
         }
         merged_tags = _normalize_retain_tags(list(self._retain_tags) + _normalize_retain_tags(tags))
@@ -1081,7 +1159,201 @@ class HindsightMemoryProvider(MemoryProvider):
         """Hand *job* to the (lazily started) writer and arm the atexit drain."""
         self._ensure_writer()
         self._register_atexit()
+        self._maybe_enqueue_bank_config_push()
         self._retain_queue.put(job)
+
+    def _maybe_enqueue_bank_config_push(self) -> None:
+        """Queue the bank-config push ahead of the first retain job (once per successful push).
+
+        Banks are auto-created server-side by the first retain, so an early push can
+        404; the guard flag only clears on success, letting every later retain batch
+        retry until the bank exists and the config lands. Auto-created banks are thus
+        born with missions/dispositions/labels instead of server defaults.
+        """
+        if getattr(self, "_bank_config_pushed", False) or self._mode == "disabled":
+            return
+        updates = self._build_bank_config_updates()
+        if not updates:
+            self._bank_config_pushed = True  # nothing configured to push, ever
+            return
+        bank_id = self._bank_id
+
+        def _push_bank_config() -> None:
+            try:
+                self._run_hindsight_operation(lambda c: c._aupdate_bank_config(bank_id, updates))
+            except Exception as exc:
+                # Leave the flag set-false so the next retain batch retries once the
+                # bank exists / the server is reachable; a failed push must never
+                # break the retain path it rides on.
+                logger.warning("Hindsight bank-config push failed for %s (will retry on next retain): %s",
+                               bank_id, exc)
+                return
+            self._bank_config_pushed = True
+            logger.info("Hindsight bank config pushed to %s (%d keys)", bank_id, len(updates))
+
+        self._retain_queue.put(_push_bank_config)
+
+    def _build_bank_config_updates(self) -> Dict[str, Any]:
+        """Flatten the bank_* config keys into a PATCH /config updates payload.
+
+        Attrs are read defensively: session-switch tests build providers via
+        ``object.__new__`` (no ``__init__``), and a missing attr must mean
+        "nothing to push", never an exception on the retain path.
+        """
+        updates: Dict[str, Any] = {}
+        if getattr(self, "_bank_mission", ""):
+            updates["mission"] = self._bank_mission
+        if getattr(self, "_bank_retain_mission", None):
+            updates["retain_mission"] = self._bank_retain_mission
+        if getattr(self, "_bank_observations_mission", None):
+            updates["observations_mission"] = self._bank_observations_mission
+        if getattr(self, "_bank_reflect_mission", None):
+            updates["reflect_mission"] = self._bank_reflect_mission
+        dispositions = getattr(self, "_bank_dispositions", None) or {}
+        for src, dst in (("skepticism", "disposition_skepticism"),
+                         ("literalism", "disposition_literalism"),
+                         ("empathy", "disposition_empathy")):
+            if src in dispositions:
+                updates[dst] = int(dispositions[src])
+        if getattr(self, "_bank_entity_labels", None):
+            updates["entity_labels"] = self._bank_entity_labels
+        return updates
+
+    # -- compaction checkpoint (fail-closed, checkpoint API v2) -------------------
+
+    pre_compress_checkpoint_api_version = 2
+    _precompress_counter = 0  # per-provider compaction counter -> stable document ids
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]], *,
+                        evidence_messages: Optional[List[Dict[str, Any]]] = None,
+                        require_checkpoint: bool = False, **kwargs) -> str:
+        """Flush the un-retained turn delta BEFORE the window is discarded.
+
+        Design (rev 2, operator finding 2026-09-09): the discard window is always
+        OLDER than the session's unshipped tail — auto-retain ships every N turns,
+        and the live tail sits in compaction's protected zone. Turns below the
+        watermark are already durably retained server-side (async accepts are
+        durable: document text is stored before extraction, which retries
+        server-side). So the checkpoint only needs to (1) ship the small delta
+        through the NORMAL session document (single-writer serialization, no
+        duplicate precompress documents re-extracting a quarter-million tokens),
+        and (2) verify that ship was accepted, within a budget strictly below the
+        compression stall watchdog (120s) so a slow memory lane degrades into
+        skip-compaction instead of stalling the turn.
+
+        Returns a one-line confirmation for the compression summary prompt. Raises
+        on failure when ``require_checkpoint`` so the caller keeps the uncompressed
+        transcript (fail-closed); returns "" on failure otherwise (best-effort).
+        """
+        try:
+            window = evidence_messages if evidence_messages is not None else messages
+            has_direct = any(
+                isinstance(m, dict) and str(m.get("role", "")) in ("user", "assistant")
+                and str(m.get("content", "") or "").strip()
+                for m in (window or [])
+            )
+            document_id, update_mode = self._resolve_retain_target(self._document_id)
+            start = self._last_retained_turn_count if update_mode == "append" else 0
+            delta = list(self._session_turns[start:])
+            if delta:
+                job = self._make_turn_retain_job(delta, document_id=document_id,
+                                                 update_mode=update_mode,
+                                                 label="pre-compress checkpoint")
+                self._enqueue_and_verify_checkpoint(job, f"delta flush ({len(delta)} turns)")
+                new_watermark = start + len(delta)
+                if update_mode == "append" and self._last_retained_turn_count < new_watermark:
+                    # Advance ONLY after verified success: a failed ship must leave
+                    # the delta un-retained so the next attempt retries it.
+                    self._last_retained_turn_count = new_watermark
+                line = (f"Hindsight checkpoint: {len(delta)} unretained turns flushed to bank "
+                        f"{self._bank_id} (document {document_id}); earlier turns already retained")
+            elif not self._auto_retain and has_direct:
+                # No auto-retain path ever shipped these turns (tools-only retain
+                # cadence, auto_retain off): the empty buffer is NOT "all shipped".
+                # Fall back to a verbatim window ship so fail-closed still holds.
+                turns = [m for m in (window or [])
+                         if isinstance(m, dict) and str(m.get("role", "")) in ("user", "assistant")
+                         and str(m.get("content", "") or "").strip()]
+                self._precompress_counter += 1
+                fallback_doc = f"{self._session_id or 'session'}-precompress-{self._precompress_counter}"
+                content = "[" + ",".join(
+                    json.dumps({"role": m.get("role"), "content": m.get("content"),
+                                "timestamp": _event_timestamp()}, ensure_ascii=False)
+                    for m in turns
+                ) + "]"
+                session_tag = f"session:{self._session_id}" if self._session_id else "session:unknown"
+                item = self._build_retain_kwargs(
+                    content,
+                    context="pre-compaction checkpoint of the transcript window about to be discarded",
+                    tags=[session_tag, "compaction"],
+                )
+                job = (lambda item=item, doc=fallback_doc:
+                       self._retain_batch(item, bank_id=self._bank_id, document_id=doc,
+                                          retain_async=False))
+                self._enqueue_and_verify_checkpoint(job, f"verbatim window ship ({len(turns)} turns)")
+                line = (f"Hindsight checkpoint: {len(turns)} messages retained to bank "
+                        f"{self._bank_id} (document {fallback_doc})")
+            else:
+                # Auto-retain on and watermark caught up: everything below the
+                # watermark is already shipped; nothing unshipped to flush.
+                logger.debug("on_pre_compress: nothing to checkpoint (all turns retained)")
+                return ""
+            logger.debug("on_pre_compress: %s", line)
+            return line
+        except Exception as e:
+            if require_checkpoint:
+                logger.warning("Hindsight checkpoint FAILED (require_checkpoint=True): %s", e)
+                raise
+            logger.warning("Hindsight checkpoint skipped (best-effort): %s", e)
+            return ""
+
+    def _enqueue_and_verify_checkpoint(self, job: Callable[[], None], what: str) -> None:
+        """Run *job* on the writer thread and verify acceptance within the
+        checkpoint budget (strictly below the 120s compression stall watchdog,
+        so a slow memory lane degrades into skip-compaction, never a stall)."""
+        shipped = threading.Event()
+        outcome: list[bool] = []
+
+        def _watched() -> None:
+            try:
+                job()
+                outcome.append(True)
+            except Exception:
+                outcome.append(False)
+                raise
+            finally:
+                shipped.set()
+
+        self._enqueue_retain(_watched)
+        if not shipped.wait(timeout=self._checkpoint_timeout):
+            raise TimeoutError(
+                f"checkpoint {what} not accepted within {self._checkpoint_timeout:.0f}s "
+                f"(memory lane slow/overloaded)")
+        if not outcome or outcome[0] is not True:
+            raise RuntimeError(f"checkpoint {what} failed (see writer log)")
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Flush remaining buffered turns synchronously so session close never loses
+        them. Exceptions are swallowed-and-logged: closing a session must not crash
+        because the memory server is unavailable."""
+        try:
+            if not self._session_turns:
+                logger.debug("on_session_end: no pending turns")
+                return
+            document_id, update_mode = self._resolve_retain_target(self._document_id)
+            start = self._last_retained_turn_count if update_mode == "append" else 0
+            turns_to_retain = self._session_turns[start:]
+            if not turns_to_retain:
+                logger.debug("on_session_end: no new turns since last retain")
+                return
+            job = self._make_turn_retain_job(turns_to_retain, document_id=document_id,
+                                             update_mode=update_mode, label="session-end flush")
+            job()  # synchronous: the writer queue dies with the session
+            self._session_turns = []
+            self._last_retained_turn_count = 0
+            logger.debug("on_session_end: flushed %d turns", len(turns_to_retain))
+        except Exception as e:
+            logger.warning("on_session_end flush failed (session close continues): %s", e, exc_info=True)
 
     # -- tools -------------------------------------------------------------------
 
@@ -1094,7 +1366,20 @@ class HindsightMemoryProvider(MemoryProvider):
                                          occurred_at=args.get("occurred_at"))
         logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                      self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id)
+        try:
+            self._retain_batch(item, bank_id=self._bank_id)
+        finally:
+            # Arm the bank-config push on the tool path too, even if the retain
+            # itself failed. The push is otherwise armed only by sync_turn's
+            # auto-retain gate: a session whose sole retain is this tool would
+            # leave the bank on server defaults forever — missions, dispositions
+            # and entity labels never land (operator finding 2026-09-13).
+            # A push against a not-yet-created bank 404s, logs, and retries on
+            # the next retain; writer + atexit drain guarantee completion before
+            # process exit.
+            self._ensure_writer()
+            self._register_atexit()
+            self._maybe_enqueue_bank_config_push()
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 

@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+import plugins.memory.hindsight as provider_module
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -94,6 +95,23 @@ def _make_mock_client():
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
+
+
+def _make_precompress_provider(tmp_path, monkeypatch, retain_error: Exception | None = None):
+    """Provider with a mocked client for on_pre_compress tests.
+    Returns (provider, retain_calls) where retain_calls captures aretain_batch kwargs."""
+    p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+    p._client = _make_mock_client()
+    calls: list[dict] = []
+
+    def _capture_aretain_batch(**kwargs):
+        calls.append(kwargs)
+        if retain_error is not None:
+            raise retain_error
+        return SimpleNamespace(ok=True)
+
+    p._client.aretain_batch = AsyncMock(side_effect=_capture_aretain_batch)
+    return p, calls
 
 
 def _provider_for_mode(tmp_path, monkeypatch, mode: str):
@@ -1384,6 +1402,60 @@ class TestBankIdTemplate:
         assert p._bank_id_template == "hermes-{profile}"
 
 
+    def test_hindsight_bank_id_env_wins_over_config_bank_id(self, tmp_path, monkeypatch):
+        # The tokbuster-kanban plugin sets HINDSIGHT_BANK_ID per worker (board
+        # -> repo bank) BEFORE the provider initializes. With config.json
+        # present, the env var must still win — otherwise every worker writes
+        # to the config's shared bank and the per-repo wiring is dead on
+        # arrival (the R28 memory-consolidation finding).
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "hermes::scratch",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HINDSIGHT_BANK_ID", "hermes::repo-a")
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="cli",
+            agent_identity="coder",
+            agent_workspace="repo-a",
+        )
+        assert p._bank_id == "hermes::repo-a"
+
+    def test_hindsight_bank_id_unset_uses_config_bank_id(self, tmp_path, monkeypatch):
+        # No env var -> config.json's static bank_id is the fallback (no
+        # regression for processes that never set the plugin's env var).
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "hermes::scratch",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("HINDSIGHT_BANK_ID", raising=False)
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="cli",
+            agent_identity="coder",
+            agent_workspace="repo-a",
+        )
+        assert p._bank_id == "hermes::scratch"
+
+
 # ---------------------------------------------------------------------------
 # Availability tests
 # ---------------------------------------------------------------------------
@@ -1727,3 +1799,381 @@ class TestMultiplexBackgroundScope:
                 t.join(timeout=5)
         assert created == ["p1-secret"]
         assert "Daemon started successfully" in (home / "logs" / "hindsight-embed.log").read_text()
+
+
+class TestRedaction:
+    """B1: retain-side secret scrub — no secret-shaped string reaches the bank."""
+
+    # Fake secret shapes, built programmatically so no credential-shaped literal
+    # appears in this file (GitHub push protection scans diffs and would block
+    # even the truncated placeholders used here before).
+    SECRET_TEXT = (
+        "deploy used key=" + "sk-abc...l012" + " and "
+        "Authorization: Bearer " + "eyJhbG...9999" + " plus "
+        "slack " + "xoxb-1...mnop" + " and "
+        "github gh p_q: " + "ghp_Ab...7890" + " plus "
+        "aws " + "AKIAIO...MPLE" + " and "
+        "config api_key: " + "supersecretvalue12345"
+    )
+    SCRUBBED = "[REDACTED]"
+
+    def test_scrub_secrets_redacts_known_shapes(self):
+        # Short truncated placeholders only matched the labelled-value pattern
+        # (or none), so they proved nothing about the per-provider patterns.
+        # These full-length fakes actually exercise each pattern in
+        # _SECRET_PATTERNS.
+        for secret in (
+            "sk-" + "a" * 30,
+            "Bearer " + "e" * 30,
+            "eyJ" + "h" * 30,
+            "xoxb-" + "1" * 16,
+            "ghp_" + "A" * 30,
+            "AKIA" + "B" * 16,
+        ):
+            assert provider_module._scrub_secrets(f"before {secret} after") == "before [REDACTED] after", secret
+
+    def test_scrub_secrets_redacts_labelled_value_keeps_label(self):
+        assert provider_module._scrub_secrets("before api_key: " + "s" * 20 + " after") == "before api_key: [REDACTED] after"
+
+    def test_scrub_secrets_leaves_normal_text(self):
+        normal = "The squinglefritz parameter is set to verified-7741 in config.json; port 8890."
+        assert provider_module._scrub_secrets(normal) == normal
+
+    def test_scrub_secrets_handles_non_string(self):
+        assert provider_module._scrub_secrets(None) == ""
+        assert provider_module._scrub_secrets("") == ""
+        assert provider_module._scrub_secrets(12345) == "12345"
+
+    def test_scrub_secrets_metadata_values(self):
+        meta = {"session": "s-1", "note": "token: superservicetoken999"}
+        out = provider_module._scrub_secrets(meta)
+        assert out["note"] == "token: [REDACTED]"
+        assert out["session"] == "s-1"
+
+    def test_build_retain_kwargs_scrubs_content_and_metadata(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        item = p._build_retain_kwargs(
+            "ran deploy with Bearer eyJhbGciOiJIUzI1NiJ9AbCdEfGh1234567890 ok",
+            metadata={"source": "test", "leak": "xoxb-123456789012-123456789012-abcdefghij"},
+        )
+        assert "eyJhbG" not in item["content"]
+        assert "[REDACTED]" in item["content"]
+        assert "xoxb-" not in item["metadata"]["leak"]
+        assert item["metadata"]["source"] == "test"
+
+
+class TestPreCompressCheckpoint:
+    """B2 rev 2: on_pre_compress flushes the un-retained DELTA through the normal
+    session document (no duplicate precompress re-ship of the whole window), with a
+    bounded wait strictly below the 120s stall watchdog; fail-closed preserved."""
+
+    MSGS = [
+        {"role": "user", "content": "Remember the frobnicator runs on port 7741"},
+        {"role": "assistant", "content": "Noted the frobnicator port."},
+        {"role": "user", "content": "Also the gribble threshold is verified-7742"},
+    ]
+
+    def _provider(self, tmp_path, monkeypatch, retain_error=None):
+        p, calls = _make_precompress_provider(tmp_path, monkeypatch, retain_error=retain_error)
+        p._session_id = "test-session"
+        p._document_id = "test-session-20260908"
+        return p, calls
+
+    def _buffer_turns(self, p, n=3):
+        turns = []
+        for i in range(n):
+            turns.append(json.dumps({"role": "user", "content": f"turn fact {i}-77xx"}))
+            turns.append(json.dumps({"role": "assistant", "content": f"noted {i}"}))
+        p._session_turns = turns[:n]
+        p._last_retained_turn_count = 0
+
+    def test_class_advertises_checkpoint_api_v2(self, tmp_path, monkeypatch):
+        p, _ = self._provider(tmp_path, monkeypatch)
+        assert p.pre_compress_checkpoint_api_version == 2
+
+    def test_success_flushes_delta_and_returns_checkpoint_line(self, tmp_path, monkeypatch):
+        p, calls = self._provider(tmp_path, monkeypatch)
+        self._buffer_turns(p, n=2)
+        out = p.on_pre_compress(self.MSGS, require_checkpoint=True)
+        assert "Hindsight checkpoint" in out and "2 unretained turns" in out
+        assert len(calls) == 1
+        kwargs = calls[0]
+        assert kwargs["bank_id"] == "test-bank"
+        # REV 2: ships through the NORMAL session document, NOT a *-precompress-* id
+        assert "-precompress-" not in str(kwargs["document_id"])
+        assert kwargs["document_id"]  # session document id resolved
+        assert "turn fact" in kwargs["items"][0]["content"]
+
+    def test_no_duplicate_ship_when_all_turns_already_retained(self, tmp_path, monkeypatch):
+        p, calls = self._provider(tmp_path, monkeypatch)
+        self._buffer_turns(p, n=2)
+        p._auto_retain = True
+        # Pin APPEND mode (live config on hindsight >= 0.5.0): watermark caught up
+        monkeypatch.setattr(
+            HindsightMemoryProvider, "_resolve_retain_target",
+            lambda self, fallback: (self._document_id, "append"),
+        )
+        p._last_retained_turn_count = len(p._session_turns)
+        out = p.on_pre_compress(self.MSGS, require_checkpoint=True)
+        assert len(calls) == 0  # nothing unshipped: NO second belt re-extracting the window
+        assert out == ""  # "all shipped" -> empty context line, no raise
+
+    def test_failure_with_require_checkpoint_raises(self, tmp_path, monkeypatch):
+        p, _ = self._provider(tmp_path, monkeypatch, retain_error=RuntimeError("server down"))
+        self._buffer_turns(p, n=2)
+        with pytest.raises(RuntimeError):
+            p.on_pre_compress(self.MSGS, require_checkpoint=True)
+
+    def test_failure_without_require_checkpoint_returns_empty(self, tmp_path, monkeypatch):
+        p, calls = self._provider(tmp_path, monkeypatch, retain_error=RuntimeError("server down"))
+        self._buffer_turns(p, n=2)
+        assert p.on_pre_compress(self.MSGS, require_checkpoint=False) == ""
+        assert len(calls) == 1  # attempt was made, failure swallowed
+
+    def test_timeout_raises_before_stall_watchdog(self, tmp_path, monkeypatch):
+        """A memory lane slower than checkpoint_timeout must fail INTO the
+        skip-compaction degrade path, never race the 120s stall watchdog."""
+        p, calls = self._provider(tmp_path, monkeypatch)
+        self._buffer_turns(p, n=2)
+        p._checkpoint_timeout = 0.05
+
+        import threading as _th
+        held = _th.Event()
+        orig_start = p._writer_thread
+
+        def _slow_job():
+            held.wait(timeout=5)  # never completes within the budget
+
+        # Ship the watched wrapper's inner job away: enqueue via the public path
+        # but make the retain itself hang.
+        p._enqueue_retain = lambda job: (
+            p._ensure_writer(), p._register_atexit(), p._retain_queue.put(job)
+        )
+        # Wrap: replace _make_turn_retain_job to return a hanging inner
+        p._make_turn_retain_job = lambda *a, **k: (_slow_job)
+        with pytest.raises(TimeoutError):
+            p.on_pre_compress(self.MSGS, require_checkpoint=True)
+
+    def test_noop_on_empty_delta_no_raise(self, tmp_path, monkeypatch):
+        p, calls = self._provider(tmp_path, monkeypatch)
+        p._session_turns = []
+        p._last_retained_turn_count = 0
+        assert p.on_pre_compress([], require_checkpoint=True) == ""
+        assert len(calls) == 0
+
+
+class TestSessionEndFlush:
+    """B3: on_session_end flushes remaining buffered turns; never crashes session close."""
+
+    def test_flushes_pending_buffered_turns(self, tmp_path, monkeypatch):
+        p, calls = _make_precompress_provider(tmp_path, monkeypatch)
+        p._session_id = "test-session"
+        p._document_id = "test-session-20260908"
+        p._session_turns = [
+            json.dumps({"role": "user", "content": "unbuffered fact quux-7744"}),
+            json.dumps({"role": "assistant", "content": "noted quux-7744"}),
+        ]
+        p._last_retained_turn_count = 0
+        p.on_session_end([])
+        assert len(calls) == 1
+        assert "quux-7744" in calls[0]["items"][0]["content"]
+
+    def test_noop_when_buffer_empty(self, tmp_path, monkeypatch):
+        p, calls = _make_precompress_provider(tmp_path, monkeypatch)
+        p._session_id = "test-session"
+        p._session_turns = []
+        p.on_session_end([])
+        assert len(calls) == 0
+
+    def test_exception_swallowed_session_close_survives(self, tmp_path, monkeypatch):
+        p, _ = _make_precompress_provider(tmp_path, monkeypatch, retain_error=RuntimeError("server down"))
+        p._session_id = "test-session"
+        p._document_id = "test-session-20260908"
+        p._session_turns = [json.dumps({"role": "user", "content": "fact"})]
+        p.on_session_end([])  # must not raise
+
+    def test_uses_resolve_retain_target_document_id(self, tmp_path, monkeypatch):
+        p, calls = _make_precompress_provider(tmp_path, monkeypatch)
+        p._session_id = "test-session"
+        p._document_id = "test-session-20260908"
+        p._session_turns = [json.dumps({"role": "user", "content": "fact"})]
+        # Force the legacy path so document_id == _document_id fallback
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.HindsightMemoryProvider._resolve_retain_target",
+            lambda self, fallback: (fallback, None),
+        )
+        p.on_session_end([])
+        assert calls[0]["document_id"] == "test-session-20260908"
+
+
+class TestWorkspaceRetainContext:
+    """B4: retain context names the workspace; empty/hermes falls back to the default."""
+
+    def test_workspace_named_in_context(self):
+        ctx = provider_module._workspace_retain_context("kima-hub")
+        assert "kima-hub" in ctx and "engineering session" in ctx
+
+    def test_hermes_and_empty_fall_back_to_default(self):
+        assert provider_module._workspace_retain_context("hermes") == provider_module._RETAIN_CONTEXT_DEFAULT
+        assert provider_module._workspace_retain_context("") == provider_module._RETAIN_CONTEXT_DEFAULT
+
+    def test_explicit_config_context_wins(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        p._agent_workspace = "kima-hub"
+        p._apply_retain_policy({"retain_context": "custom context"})
+        assert p._retain_context == "custom context"
+
+    def test_initialize_applies_workspace_context(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        p.initialize(session_id="s9", hermes_home=str(tmp_path), platform="cli", agent_workspace="bs-hermes-asks")
+        assert "bs-hermes-asks" in p._retain_context
+
+    def test_retain_items_carry_timestamp(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        item = p._build_retain_kwargs("some fact")
+        assert item["timestamp"]  # ISO-8601 event timestamp present (temporal retrieval)
+
+
+    def test_recall_tags_string_config_is_normalized_to_list(self, tmp_path, monkeypatch):
+        """Comma-separated recall_tags config must reach arecall as a LIST —
+        the 0.9.2 client's RecallRequest pydantic model rejects a bare string
+        ('Input should be a valid list'). Regression: recall_tags='user:kevin'
+        in every stamped config broke ALL recall with a ValidationError."""
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        client = p._get_client()
+        captured = {}
+
+        async def _fake_arecall(**kwargs):
+            captured.update(kwargs)
+            from types import SimpleNamespace
+            return SimpleNamespace(results=[])
+
+        client.arecall = AsyncMock(side_effect=_fake_arecall)
+        # Simulate the stamped config: comma-separated string
+        p._recall_tags = "user:kevin,project:rallyspark"
+        p._recall_tags_match = "any"
+        p._recall_types = ["observation"]
+        out = p._recall("rallyspark websites")
+        assert out == []
+        assert captured["tags"] == ["user:kevin", "project:rallyspark"], (
+            "recall tags must be normalized to a list, not passed as the raw string"
+        )
+        assert captured["tags_match"] == "any"
+
+    def test_recall_tags_already_list_passthrough(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        client = p._get_client()
+
+        async def _fake_arecall(**kwargs):
+            from types import SimpleNamespace
+            return SimpleNamespace(results=[])
+
+        client.arecall = AsyncMock(side_effect=_fake_arecall)
+        p._recall_tags = ["user:kevin"]
+        p._recall("q")
+        assert client.arecall.call_args.kwargs["tags"] == ["user:kevin"]
+
+    def test_recall_tags_none_omits_param(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        client = p._get_client()
+
+        async def _fake_arecall(**kwargs):
+            from types import SimpleNamespace
+            return SimpleNamespace(results=[])
+
+        client.arecall = AsyncMock(side_effect=_fake_arecall)
+        p._recall_tags = None
+        p._recall("q")
+        assert "tags" not in client.arecall.call_args.kwargs
+
+
+class TestBankConfigProvisioning:
+    """A3: bank_* config keys are pushed to the server on initialize (auto-created
+    banks are born with missions/dispositions/labels)."""
+
+    CFG = {
+        "bank_retain_mission": "retain mission A3",
+        "bank_observations_mission": "observations mission A3",
+        "bank_reflect_mission": "reflect mission A3",
+        "bank_dispositions": {"skepticism": 4, "literalism": 4, "empathy": 1},
+        "bank_entity_labels": [
+            {"key": "project", "type": "multi-values", "values": [{"value": "hermes"}]},
+        ],
+    }
+
+    def _provider_with_config(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "local_external",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "memory_mode": "hybrid",
+        }
+        config.update(self.CFG)
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        provider = HindsightMemoryProvider()
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        return provider
+
+    def test_initialize_pushes_bank_config(self, tmp_path, monkeypatch):
+        p = self._provider_with_config(tmp_path, monkeypatch)
+        client = p._get_client()
+        client._aupdate_bank_config = AsyncMock(return_value={})
+        p._enqueue_retain(lambda: None)   # wake the writer path deterministically
+        p._retain_queue.put(_WRITER_SENTINEL)
+        p._writer_thread.join(timeout=5)
+        client._aupdate_bank_config.assert_called_once()
+        bank_id, updates = client._aupdate_bank_config.call_args.args
+        assert bank_id == "test-bank"
+        assert updates["retain_mission"] == "retain mission A3"
+        assert updates["observations_mission"] == "observations mission A3"
+        assert updates["reflect_mission"] == "reflect mission A3"
+        assert updates["disposition_skepticism"] == 4
+        assert updates["disposition_empathy"] == 1
+        assert updates["entity_labels"] == self.CFG["bank_entity_labels"]
+
+    def test_no_push_when_no_bank_config_keys(self, tmp_path, monkeypatch):
+        p = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+        client = p._get_client()
+        client._aupdate_bank_config = AsyncMock(return_value={})
+        p._enqueue_retain(lambda: None)
+        p._retain_queue.put(_WRITER_SENTINEL)
+        p._writer_thread.join(timeout=5)
+        client._aupdate_bank_config.assert_not_called()
+
+    def test_push_failure_never_breaks_session(self, tmp_path, monkeypatch):
+        p = self._provider_with_config(tmp_path, monkeypatch)
+        client = p._get_client()
+        client._aupdate_bank_config = AsyncMock(side_effect=RuntimeError("server down"))
+        p._enqueue_retain(lambda: None)
+        p._retain_queue.put(_WRITER_SENTINEL)
+        p._writer_thread.join(timeout=5)  # must not raise
+
+    def test_push_retries_on_next_retain_after_failure(self, tmp_path, monkeypatch):
+        p = self._provider_with_config(tmp_path, monkeypatch)
+        client = p._get_client()
+        client._aupdate_bank_config = AsyncMock(side_effect=[RuntimeError("server down"), {"ok": True}])
+        p._enqueue_retain(lambda: None)
+        p._retain_queue.put(_WRITER_SENTINEL)
+        p._writer_thread.join(timeout=5)
+        assert not p._bank_config_pushed  # failure left the flag armed
+        p._ensure_writer()  # writer exited on sentinel; restart for batch two
+        p._enqueue_retain(lambda: None)
+        p._retain_queue.put(_WRITER_SENTINEL)
+        p._writer_thread.join(timeout=5)
+        assert p._bank_config_pushed
+        assert client._aupdate_bank_config.await_count == 2 or client._aupdate_bank_config.call_count == 2
+
+    def test_push_runs_only_once_after_success(self, tmp_path, monkeypatch):
+        p = self._provider_with_config(tmp_path, monkeypatch)
+        client = p._get_client()
+        client._aupdate_bank_config = AsyncMock(return_value={})
+        for _ in range(2):
+            p._enqueue_retain(lambda: None)
+            p._retain_queue.put(_WRITER_SENTINEL)
+            p._writer_thread.join(timeout=5)
+            p._ensure_writer()
+        assert p._bank_config_pushed
+        assert client._aupdate_bank_config.call_count == 1

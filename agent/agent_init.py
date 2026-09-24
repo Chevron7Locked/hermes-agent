@@ -1246,6 +1246,22 @@ def _apply_display_config(agent, _agent_cfg, platform):
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
 
 
+def _memory_workspace_slug() -> str:
+    """Stable short workspace name for memory bank templating: the containing
+    git root's basename, else the cwd basename when no repo encloses the cwd,
+    else 'hermes'."""
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+        cwd = probe = resolve_agent_cwd()
+        while not (probe / ".git").exists() and probe.parent != probe:
+            probe = probe.parent
+        if (probe / ".git").exists():
+            return probe.name or "hermes"
+        return cwd.name or "hermes"
+    except Exception:
+        return "hermes"
+
+
 def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     """Scoping kwargs for ``MemoryManager.initialize_all`` (status_callback is CLI-only:
     gateway status travels a different path and the indicator no-ops without it)."""
@@ -1280,7 +1296,7 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     with suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
         kwargs["agent_identity"] = get_active_profile_name()
-        kwargs["agent_workspace"] = "hermes"
+        kwargs["agent_workspace"] = _memory_workspace_slug()
     return kwargs
 
 

@@ -3878,7 +3878,29 @@ def _run_summary_phase(
                 # Adopted list is fully durable: re-anchor persist idx at the end so the post-
                 # compression flush skips it; run_agent marker sync realigns _session_messages.
                 agent._persist_user_message_idx = len(messages)
-        memory_context = _pre_compress_memory_context(agent, messages, checkpoint_required)
+        try:
+            memory_context = _pre_compress_memory_context(agent, messages, checkpoint_required)
+        except CompressionCheckpointUnavailable as exc:
+            # Fail-closed degrade (remediation C1): the refusal to compact without
+            # a durable checkpoint must cost context-window headroom, never the
+            # turn. Restore the attempt snapshot, release the lease, mark the
+            # block transient (a down memory server is not an incompressible
+            # session — overflow loops must defer, not exhaust), and hand the
+            # FULL transcript back uncompressed.
+            with contextlib.suppress(Exception):
+                attempt.restore_compressor(agent.context_compressor)
+            _stop_heartbeat("required memory checkpoint unavailable")
+            lease.release()
+            _emit_aborted_attempt_telemetry(agent, attempt.started_at, "checkpoint_unavailable")
+            with contextlib.suppress(Exception):
+                agent._compression_blocked_transient = f"checkpoint_unavailable: {exc}"
+            logger.warning(
+                "Compaction skipped: required pre-compress checkpoint unavailable "
+                "(session=%s, %s) — keeping the full transcript uncompressed; "
+                "compaction retries on a later turn once the memory server answers",
+                getattr(agent, "session_id", None) or "none", exc,
+            )
+            return _SummaryPhase(messages=messages, abort_prompt=_existing_system_prompt(agent, system_message))
         compress_fn, compress_kwargs = _resolve_compress_call(
             agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
             bypass_cooldown=bypass_cooldown,

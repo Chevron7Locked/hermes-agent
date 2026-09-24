@@ -35,6 +35,28 @@ class TestMemoryWorkspaceSlug:
         monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: Path("/"))
         assert _memory_workspace_slug() == "hermes"
 
+    def test_kanban_task_workspace_uses_board_slug(self, tmp_path, monkeypatch):
+        # A task-board worker's scratch folder must not become its own bank.
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        task = tmp_path / "kanban" / "boards" / "iffy-build" / "workspaces" / "t_abc123"
+        task.mkdir(parents=True)
+        monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: task)
+        assert _memory_workspace_slug() == "iffy-build"
+
+    def test_kanban_task_workspace_uses_board_default_workdir_repo(self, tmp_path, monkeypatch):
+        import json
+
+        repo = tmp_path / "projects" / "game1-cozy"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "src").mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        board = tmp_path / "kanban" / "boards" / "quiet-stacks"
+        task = board / "workspaces" / "t_def456" / "sub"
+        task.mkdir(parents=True)
+        (board / "board.json").write_text(json.dumps({"default_workdir": str(repo / "src")}))
+        monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: task)
+        assert _memory_workspace_slug() == "game1-cozy"
+
     def test_agent_init_passes_real_slug(self, monkeypatch):
         # The kwargs builder must call the slug helper, not hardcode "hermes".
         import agent.agent_init as mod

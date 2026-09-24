@@ -1246,18 +1246,36 @@ def _apply_display_config(agent, _agent_cfg, platform):
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
 
 
+def _git_root_or_self(path):
+    probe = path
+    while not (probe / ".git").exists() and probe.parent != probe:
+        probe = probe.parent
+    return probe if (probe / ".git").exists() else path
+
+
 def _memory_workspace_slug() -> str:
     """Stable short workspace name for memory bank templating: the containing
     git root's basename, else the cwd basename when no repo encloses the cwd,
-    else 'hermes'."""
+    else 'hermes'. Inside a kanban task-board scratch workspace
+    (``.../boards/<board>/workspaces/<task>``) the board's project is used
+    instead of the per-task folder: the git-root basename of the board's
+    ``default_workdir``, else the board slug — so task memories land in the
+    project's bank, not one orphan bank per task."""
     try:
         from agent.runtime_cwd import resolve_agent_cwd
-        cwd = probe = resolve_agent_cwd()
-        while not (probe / ".git").exists() and probe.parent != probe:
-            probe = probe.parent
-        if (probe / ".git").exists():
-            return probe.name or "hermes"
-        return cwd.name or "hermes"
+        cwd = resolve_agent_cwd()
+        with suppress(Exception):
+            from pathlib import Path
+            from hermes_cli import kanban_db as _kb
+            from hermes_cli.kanban_db_workspace import _managed_scratch_path_info
+            managed, board = _managed_scratch_path_info(cwd)
+            if managed and board:
+                workdir = (_kb.read_board_metadata(board).get("default_workdir") or "").strip()
+                if workdir:
+                    return _git_root_or_self(Path(workdir).expanduser()).name or board
+                return board
+        probe = _git_root_or_self(cwd)
+        return probe.name or "hermes"
     except Exception:
         return "hermes"
 

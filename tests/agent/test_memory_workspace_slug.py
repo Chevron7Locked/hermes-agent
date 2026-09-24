@@ -70,3 +70,16 @@ class TestMemoryWorkspaceSlug:
         import inspect
         src = inspect.getsource(mod)
         assert 'kwargs["agent_workspace"] = "hermes"' not in src
+
+
+def test_linked_worktree_uses_main_repo_name(tmp_path, monkeypatch):
+    """A kanban task worktree (<repo>/.worktrees/<id>) must map to the repo's bank, not the task's."""
+    import subprocess
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"], cwd=repo, check=True)
+    subprocess.run(["git", "worktree", "add", "-q", ".worktrees/t_abc123", "-b", "task-t_abc123"], cwd=repo, check=True)
+    from agent import agent_init
+    monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: repo / ".worktrees" / "t_abc123")
+    assert agent_init._memory_workspace_slug() == "myrepo"

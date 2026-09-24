@@ -18,11 +18,11 @@ class TestMemoryWorkspaceSlug:
         monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: sub)
         assert _memory_workspace_slug() == tmp_path.name
 
-    def test_non_repo_dir_yields_cwd_basename(self, tmp_path, monkeypatch):
+    def test_non_repo_dir_yields_general(self, tmp_path, monkeypatch):
         plain = tmp_path / "plain-project"
         plain.mkdir()
         monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: plain)
-        assert _memory_workspace_slug() == "plain-project"
+        assert _memory_workspace_slug() == "general"
 
     def test_exception_yields_hermes(self, monkeypatch):
         def _boom():
@@ -31,9 +31,9 @@ class TestMemoryWorkspaceSlug:
         monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", _boom)
         assert _memory_workspace_slug() == "hermes"
 
-    def test_root_yields_hermes(self, monkeypatch):
+    def test_root_yields_general(self, monkeypatch):
         monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: Path("/"))
-        assert _memory_workspace_slug() == "hermes"
+        assert _memory_workspace_slug() == "general"
 
     def test_kanban_task_workspace_uses_board_slug(self, tmp_path, monkeypatch):
         # A task-board worker's scratch folder must not become its own bank.

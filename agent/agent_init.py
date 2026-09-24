@@ -1268,8 +1268,7 @@ def _git_root_or_self(path):
 
 def _memory_workspace_slug() -> str:
     """Stable short workspace name for memory bank templating: the containing
-    git root's basename, else the cwd basename when no repo encloses the cwd,
-    else 'hermes'. Inside a kanban task-board scratch workspace
+    git root's basename, else 'general' when no repo encloses the cwd. Inside a kanban task-board scratch workspace
     (``.../boards/<board>/workspaces/<task>``) the board's project is used
     instead of the per-task folder: the git-root basename of the board's
     ``default_workdir``, else the board slug — so task memories land in the
@@ -1288,6 +1287,10 @@ def _memory_workspace_slug() -> str:
                     return _git_root_or_self(Path(workdir).expanduser()).name or board
                 return board
         probe = _git_root_or_self(cwd)
+        if probe == cwd and not (cwd / ".git").exists():
+            # Not inside any git repo (webui default ~/workspace, the home folder, /tmp...):
+            # one shared bank instead of a stray bank per folder.
+            return "general"
         return probe.name or "hermes"
     except Exception:
         return "hermes"

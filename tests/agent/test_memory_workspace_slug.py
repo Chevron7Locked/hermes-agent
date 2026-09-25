@@ -83,3 +83,16 @@ def test_linked_worktree_uses_main_repo_name(tmp_path, monkeypatch):
     from agent import agent_init
     monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: repo / ".worktrees" / "t_abc123")
     assert agent_init._memory_workspace_slug() == "myrepo"
+
+
+def test_user_worktree_outside_dot_worktrees_keeps_its_own_name(tmp_path, monkeypatch):
+    """A worktree the user made (not under .worktrees/) is its own project and keeps its folder name."""
+    import subprocess
+    repo = tmp_path / "mainrepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"], cwd=repo, check=True)
+    subprocess.run(["git", "worktree", "add", "-q", str(tmp_path / "unified"), "-b", "unified"], cwd=repo, check=True)
+    from agent import agent_init
+    monkeypatch.setattr("agent.runtime_cwd.resolve_agent_cwd", lambda: tmp_path / "unified")
+    assert agent_init._memory_workspace_slug() == "unified"

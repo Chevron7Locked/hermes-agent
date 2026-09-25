@@ -1252,17 +1252,10 @@ def _git_root_or_self(path):
         probe = probe.parent
     if not (probe / ".git").exists():
         return path
-    # A linked worktree (e.g. a kanban task's <repo>/.worktrees/<id>) has a ``.git`` FILE
-    # ("gitdir: <repo>/.git/worktrees/<id>"): name the bank after the main repo, not the task.
-    dotgit = probe / ".git"
-    if dotgit.is_file():
-        with suppress(Exception):
-            from pathlib import Path
-            gitdir = Path(dotgit.read_text().split("gitdir:", 1)[1].strip())
-            if not gitdir.is_absolute():
-                gitdir = (probe / gitdir).resolve()
-            if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
-                return gitdir.parent.parent.parent
+    # A Hermes kanban task worktree lives at <checkout>/.worktrees/<task-id>: its memory belongs to the
+    # checkout that holds .worktrees/ (not the task id, and not whatever repo git records it under).
+    if probe.parent.name == ".worktrees":
+        return probe.parent.parent
     return probe
 
 
